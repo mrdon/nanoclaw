@@ -8,7 +8,8 @@ import {
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
-import { WhatsAppChannel } from './channels/whatsapp.js';
+import { SlackChannel } from './channels/slack.js';
+import { readEnvFile } from './env.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -19,7 +20,6 @@ import { cleanupOrphans, ensureContainerRuntimeRunning } from './container-runti
 import {
   getAllChats,
   getAllRegisteredGroups,
-  getAllSessions,
   getAllTasks,
   getMessagesSince,
   getNewMessages,
@@ -27,7 +27,6 @@ import {
   initDatabase,
   setRegisteredGroup,
   setRouterState,
-  setSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
@@ -43,12 +42,10 @@ import { logger } from './logger.js';
 export { escapeXml, formatMessages } from './router.js';
 
 let lastTimestamp = '';
-let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
@@ -61,7 +58,6 @@ function loadState(): void {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
   }
-  sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
@@ -167,6 +163,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     'Processing messages',
   );
 
+  // Extract threadTs from last missed message for threading replies
+  const threadTs = missedMessages[missedMessages.length - 1].thread_ts;
+  queue.setCurrentThreadTs(chatJid, threadTs || null);
+
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -179,6 +179,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   };
 
   await channel.setTyping?.(chatJid, true);
+  let ackId = await channel.sendAck?.(chatJid, threadTs);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -190,7 +191,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        // Delete ack message before first real output (from initial or piped messages)
+        const pipedAck = queue.consumePendingAck(chatJid);
+        if (pipedAck) {
+          await channel.deleteMessage?.(chatJid, pipedAck);
+        }
+        if (ackId) {
+          await channel.deleteMessage?.(chatJid, ackId);
+          ackId = undefined;
+        }
+        const currentThread = queue.getCurrentThreadTs(chatJid);
+        await channel.sendMessage(chatJid, text, currentThread || undefined);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -204,10 +215,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (result.status === 'error') {
       hadError = true;
     }
-  });
+  }, threadTs);
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Clean up ack if it was never replaced by real output
+  if (ackId) {
+    await channel.deleteMessage?.(chatJid, ackId);
+    ackId = undefined;
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -231,9 +248,9 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  threadTs?: string,
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -260,36 +277,20 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
-
   try {
     const output = await runContainerAgent(
       group,
       {
         prompt,
-        sessionId,
+        sessionId: undefined,
         groupFolder: group.folder,
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
-      wrappedOnOutput,
+      onOutput,
     );
-
-    if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
-    }
 
     if (output.status === 'error') {
       logger.error(
@@ -372,7 +373,10 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // Extract threadTs from the last message for threading
+          const threadTs = messagesToSend[messagesToSend.length - 1].thread_ts;
+
+          if (queue.sendMessage(chatJid, formatted, threadTs)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -380,7 +384,12 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Show typing indicator while the container processes the piped message
+            // Send ack and typing indicator while the container processes the piped message
+            channel.sendAck?.(chatJid, threadTs)?.then((ackId) => {
+              if (ackId) queue.setPendingAck(chatJid, ackId);
+            }).catch((err) =>
+              logger.warn({ chatJid, err }, 'Failed to send ack for piped message'),
+            );
             channel.setTyping?.(chatJid, true)?.catch((err) =>
               logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
             );
@@ -445,14 +454,20 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  const slackEnv = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
+  const slackBotToken = process.env.SLACK_BOT_TOKEN || slackEnv.SLACK_BOT_TOKEN;
+  const slackAppToken = process.env.SLACK_APP_TOKEN || slackEnv.SLACK_APP_TOKEN;
+  if (!slackBotToken || !slackAppToken) {
+    logger.fatal('SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env');
+    process.exit(1);
+  }
+  const slack = new SlackChannel({ ...channelOpts, botToken: slackBotToken, appToken: slackAppToken });
+  channels.push(slack);
+  await slack.connect();
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
-    getSessions: () => sessions,
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
@@ -469,11 +484,12 @@ async function main(): Promise<void> {
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      const threadTs = queue.getCurrentThreadTs(jid) || undefined;
+      return channel.sendMessage(jid, text, threadTs);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
+    syncGroupMetadata: () => Promise.resolve(),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });

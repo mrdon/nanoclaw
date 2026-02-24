@@ -47,12 +47,14 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
-## Message Formatting
+## Slack Formatting
 
-NEVER use markdown. Only use WhatsApp/Telegram formatting:
-- *single asterisks* for bold (NEVER **double asterisks**)
-- _underscores_ for italic
-- • bullet points
-- ```triple backticks``` for code
+Messages are sent to Slack. Use standard markdown:
+- **Bold** (double asterisks)
+- *Italic* (single asterisks)
+- • Bullets
+- `Code snippets` (single backticks)
+- ```Code blocks``` (triple backticks)
+- Links: [text](url)
 
-No ## headings. No [links](url). No **double stars**.
+For rich messages (buttons, structured layouts, images), use the `slack-formatting` skill to produce Block Kit JSON.

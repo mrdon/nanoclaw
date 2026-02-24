@@ -64,10 +64,6 @@ function createSchema(database: Database.Database): void {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
-    );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -97,6 +93,15 @@ function createSchema(database: Database.Database): void {
     database.prepare(
       `UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`,
     ).run(`${ASSISTANT_NAME}:%`);
+  } catch {
+    /* column already exists */
+  }
+
+  // Add thread_ts column if it doesn't exist (migration for threading support)
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN thread_ts TEXT`,
+    );
   } catch {
     /* column already exists */
   }
@@ -240,7 +245,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, thread_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -250,6 +255,7 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.thread_ts || null,
   );
 }
 
@@ -291,7 +297,7 @@ export function getNewMessages(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, thread_ts
     FROM messages
     WHERE timestamp > ? AND chat_jid IN (${placeholders})
       AND is_bot_message = 0 AND content NOT LIKE ?
@@ -319,7 +325,7 @@ export function getMessagesSince(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, thread_ts
     FROM messages
     WHERE chat_jid = ? AND timestamp > ?
       AND is_bot_message = 0 AND content NOT LIKE ?
@@ -479,32 +485,6 @@ export function setRouterState(key: string, value: string): void {
   ).run(key, value);
 }
 
-// --- Session accessors ---
-
-export function getSession(groupFolder: string): string | undefined {
-  const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
-}
-
-export function setSession(groupFolder: string, sessionId: string): void {
-  db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
-}
-
-export function getAllSessions(): Record<string, string> {
-  const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
-  const result: Record<string, string> = {};
-  for (const row of rows) {
-    result[row.group_folder] = row.session_id;
-  }
-  return result;
-}
-
 // --- Registered group accessors ---
 
 export function getRegisteredGroup(
@@ -629,17 +609,6 @@ function migrateJsonState(): void {
         'last_agent_timestamp',
         JSON.stringify(routerState.last_agent_timestamp),
       );
-    }
-  }
-
-  // Migrate sessions.json
-  const sessions = migrateFile('sessions.json') as Record<
-    string,
-    string
-  > | null;
-  if (sessions) {
-    for (const [folder, sessionId] of Object.entries(sessions)) {
-      setSession(folder, sessionId);
     }
   }
 

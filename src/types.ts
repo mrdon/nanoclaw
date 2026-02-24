@@ -50,6 +50,7 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  thread_ts?: string;  // Thread parent ts (for threading replies)
 }
 
 export interface ScheduledTask {
@@ -81,12 +82,16 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string): Promise<void>;
+  sendMessage(jid: string, text: string, threadTs?: string): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: send a brief acknowledgment message, returns a message ID for later deletion
+  sendAck?(jid: string, threadTs?: string): Promise<string | undefined>;
+  // Optional: delete a previously sent message by its ID
+  deleteMessage?(jid: string, messageId: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

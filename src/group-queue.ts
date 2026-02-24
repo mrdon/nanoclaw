@@ -24,6 +24,8 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  currentThreadTs: string | null;
+  pendingAckId: string | null;
 }
 
 export class GroupQueue {
@@ -47,6 +49,8 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        currentThreadTs: null,
+        pendingAckId: null,
       };
       this.groups.set(groupJid, state);
     }
@@ -130,6 +134,28 @@ export class GroupQueue {
     if (groupFolder) state.groupFolder = groupFolder;
   }
 
+  setCurrentThreadTs(groupJid: string, threadTs: string | null): void {
+    const state = this.getGroup(groupJid);
+    state.currentThreadTs = threadTs;
+  }
+
+  getCurrentThreadTs(groupJid: string): string | null {
+    const state = this.getGroup(groupJid);
+    return state.currentThreadTs;
+  }
+
+  setPendingAck(groupJid: string, ackId: string): void {
+    const state = this.getGroup(groupJid);
+    state.pendingAckId = ackId;
+  }
+
+  consumePendingAck(groupJid: string): string | null {
+    const state = this.getGroup(groupJid);
+    const ackId = state.pendingAckId;
+    state.pendingAckId = null;
+    return ackId;
+  }
+
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
    * If tasks are pending, preempt the idle container immediately.
@@ -146,10 +172,11 @@ export class GroupQueue {
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
    */
-  sendMessage(groupJid: string, text: string): boolean {
+  sendMessage(groupJid: string, text: string, threadTs?: string): boolean {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder || state.isTaskContainer) return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
+    if (threadTs) state.currentThreadTs = threadTs;
 
     const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
     try {
@@ -214,6 +241,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.currentThreadTs = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }

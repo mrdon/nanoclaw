@@ -38,6 +38,12 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 
 Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.
 
+## Session Model
+
+Each Slack thread maintains its own session. When a thread's container exits
+and restarts, the conversation resumes. Different threads are independent sessions.
+Use your workspace files and CLAUDE.md for anything that should persist across threads.
+
 ## Memory
 
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.

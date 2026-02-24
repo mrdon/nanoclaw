@@ -64,6 +64,13 @@ function createSchema(database: Database.Database): void {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS thread_sessions (
+      thread_ts TEXT NOT NULL,
+      group_jid TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (thread_ts, group_jid)
+    );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -483,6 +490,22 @@ export function setRouterState(key: string, value: string): void {
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run(key, value);
+}
+
+// --- Thread session accessors ---
+
+export function getThreadSession(threadTs: string, groupJid: string): string | undefined {
+  const row = db
+    .prepare('SELECT session_id FROM thread_sessions WHERE thread_ts = ? AND group_jid = ?')
+    .get(threadTs, groupJid) as { session_id: string } | undefined;
+  return row?.session_id;
+}
+
+export function setThreadSession(threadTs: string, groupJid: string, sessionId: string): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO thread_sessions (thread_ts, group_jid, session_id, updated_at)
+     VALUES (?, ?, ?, ?)`,
+  ).run(threadTs, groupJid, sessionId, new Date().toISOString());
 }
 
 // --- Registered group accessors ---

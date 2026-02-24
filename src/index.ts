@@ -24,9 +24,11 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getThreadSession,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
+  setThreadSession,
   storeChatMetadata,
   storeMessage,
 } from './db.js';
@@ -277,19 +279,32 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  // Look up existing session for this thread
+  const sessionId = threadTs ? getThreadSession(threadTs, chatJid) : undefined;
+
+  // Wrap onOutput to capture newSessionId from streaming output
+  const wrappedOnOutput = onOutput && threadTs
+    ? async (result: ContainerOutput) => {
+        if (result.newSessionId && threadTs) {
+          setThreadSession(threadTs, chatJid, result.newSessionId);
+        }
+        await onOutput(result);
+      }
+    : onOutput;
+
   try {
     const output = await runContainerAgent(
       group,
       {
         prompt,
-        sessionId: undefined,
+        sessionId,
         groupFolder: group.folder,
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
-      onOutput,
+      wrappedOnOutput,
     );
 
     if (output.status === 'error') {
@@ -298,6 +313,11 @@ async function runAgent(
         'Container agent error',
       );
       return 'error';
+    }
+
+    // Save final session ID from completed run
+    if (output.newSessionId && threadTs) {
+      setThreadSession(threadTs, chatJid, output.newSessionId);
     }
 
     return 'success';
